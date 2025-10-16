@@ -1,10 +1,8 @@
 # ruff: noqa
 import jax
 import pytest
-from feedback_grape.fgrape import Gate, Decay
 from feedback_grape.fgrape import optimize_pulse, Gate, Decay
 from feedback_grape.utils.states import basis
-from feedback_grape.utils.tensor import tensor
 import re
 
 jax.config.update("jax_enable_x64", True)
@@ -741,6 +739,7 @@ def example_E_body():
 
 
 # test normal state preparation using parameterized grape
+@pytest.mark.slow
 def test_example_A():
     """
     This test tests if the max fidelity reached by example_B is above 0.99
@@ -958,7 +957,7 @@ def test_for_errors():
         initial_params=jnp.array([0.0]),
         measurement_flag=True,
     )
-    with pytest.raises(ValueError, match=re.escape("The Positive operator valued measure gate you supplied must have at least two arguments. "
+    with pytest.raises(ValueError, match=re.escape("The Positive operator valued measure gate you supplied must have two arguments. "
                         "The first argument is the measurement outcome (1, or -1) and the second argument is the list "
                         "of optimizable parameters for the measurement gate.")):
         optimize_pulse(
@@ -974,7 +973,7 @@ def test_for_errors():
         )
     
     def dummy_meas_gate(meas_outcome, params):
-        return jnp.eye(2)
+        return 0.5**0.5 * jnp.identity(2)
     
     valid_gate_meas_2 = Gate(
         gate=dummy_meas_gate,
@@ -1072,3 +1071,151 @@ def test_for_errors():
             evo_type="state",
             mode="no-measurement",
         )
+
+    # 16. Invalid povm gate (wrong number of arguments)
+    def invalid_povm_gate_wrong_args(params):
+        return jnp.eye(2)  # invalid because it doesn't take meas_outcome as first arg
+    
+    invalid_gate = Gate(
+        gate=invalid_povm_gate_wrong_args,
+        initial_params=jnp.array([0.0]),
+        measurement_flag=True,
+    )
+
+    with pytest.raises(ValueError, match=re.escape("The Positive operator valued measure gate you supplied must have two arguments. "
+                        "The first argument is the measurement outcome (1, or -1) and the second argument is the list "
+                        "of optimizable parameters for the measurement gate.")):
+        optimize_pulse(
+            U_0=basis(2),
+            C_target=basis(2),
+            system_params=[invalid_gate],
+            num_time_steps=1,
+            max_iter=1,
+            convergence_threshold=None,
+            learning_rate=0.01,
+            evo_type="state",
+            mode="lookup",
+        )
+
+    # 17. Invalid povm gate (not returning a square matrix)
+    def invalid_povm_gate_not_square(meas_outcome, params):
+        return jnp.array([[1, 0]])  # invalid because not square
+    
+    invalid_gate = Gate(
+        gate=invalid_povm_gate_not_square,
+        initial_params=jnp.array([0.0]),
+        measurement_flag=True,
+    )
+
+    with pytest.raises(AssertionError, match=re.escape("The provided measurement operator must be a square matrix.")):
+        optimize_pulse(
+            U_0=basis(2),
+            C_target=basis(2),
+            system_params=[invalid_gate],
+            num_time_steps=1,
+            max_iter=1,
+            convergence_threshold=None,
+            learning_rate=0.01,
+            evo_type="state",
+            mode="lookup",
+        )
+
+    # 18. Invalid povm gate (incompleteness)
+    def invalid_povm_gate(meas_outcome, params):
+        return jnp.eye(2) # invalid because M_1 @ M_1 + M_-1 @ M_-1 != I
+    
+    invalid_gate = Gate(
+        gate=invalid_povm_gate,
+        initial_params=jnp.array([0.0]),
+        measurement_flag=True,
+    )
+
+    with pytest.raises(AssertionError, match=re.escape("The provided measurement operators do not sum to the identity.")):
+        optimize_pulse(
+            U_0=basis(2),
+            C_target=basis(2),
+            system_params=[invalid_gate],
+            num_time_steps=1,
+            max_iter=1,
+            convergence_threshold=None,
+            learning_rate=0.01,
+            evo_type="state",
+            mode="lookup",
+        )
+
+def test_optimize_pulse():
+    import jax.numpy as jnp
+
+    # 1. Initial and final states initialization with same keys
+    def U_0_func(key):
+        # Generate a random density matrix
+        rho = jax.random.uniform(key, shape=(2, 2))
+        rho = rho @ rho.conj().T  # Make it Hermitian and positive semi-definite
+        rho = rho / jnp.trace(rho)  # Normalize to make it a valid density matrix
+        return rho
+    
+    def C_target_func(key):
+        return U_0_func(key)
+    
+    def dummy_gate(params):
+        return jnp.identity(2)
+    
+    result = optimize_pulse(
+        U_0=U_0_func,
+        C_target=C_target_func,
+        system_params=[
+            Gate(
+                gate=dummy_gate,
+                initial_params=jnp.array([0.0]),
+                measurement_flag=False,
+            )
+        ],
+        num_time_steps=1,
+        mode="no-measurement",
+        goal="fidelity",
+        max_iter=1,
+        convergence_threshold=None,
+        learning_rate=0.01,
+        evo_type="density",
+        batch_size=5,
+        eval_batch_size=3,
+    )
+
+    assert False not in [int(f) == 1 for f in result.fidelity_each_timestep], "Initial and final states are not generated from same keys."
+
+    # 2. Correct quantum channel application
+    def channel_gate(rho, params):
+        P = jnp.array([[1, 0], [0, 0]])
+        rho = P @ rho @ P
+
+        rho = rho / jnp.trace(rho)  # Renormalize
+
+        return rho
+
+    U_0 = jnp.array([[0.5, 0], [0, 0.5]])
+    C_target = jnp.array([[1, 0], [0, 0]])
+
+    result = optimize_pulse(
+        U_0=U_0,
+        C_target=C_target,
+        system_params=[
+            Gate(
+                gate=channel_gate,
+                initial_params=None,
+                measurement_flag=False,
+                quantum_channel_flag=True
+            )
+        ],
+        num_time_steps=1,
+        mode="no-measurement",
+        goal="fidelity",
+        max_iter=1,
+        convergence_threshold=None,
+        learning_rate=0.01,
+        evo_type="density",
+        batch_size=1,
+        eval_batch_size=1,
+    )
+
+    final_state = result.final_state[0]
+    assert jnp.allclose(final_state, C_target), "Quantum channel not applied correctly."

@@ -1,5 +1,6 @@
 import jax
 import numpy as np
+from inspect import signature # Use inspect.signature to determine the number of parameters in the provided callable.
 import flax.linen as nn
 import jax.numpy as jnp
 from .fidelity import is_positive_semi_definite
@@ -86,6 +87,25 @@ def apply_gate(rho_cav, gate, params, evo_type, gate_param_constraints):
     else:
         rho_meas = operator @ rho_cav
     return rho_meas
+
+def apply_channel(rho_cav, channel, params, evo_type, gate_param_constraints):
+    """
+    Apply a quantum channel to the given state. This also clips the parameters
+    to be within the specified constraints specified by the user.
+
+    Args:
+        rho_cav: Density matrix or state vector of the cavity.
+        channel: The quantum channel function to apply.
+        params: Parameters for the quantum channel.
+        evo_type: Evolution type, either "density" or "state".
+        gate_param_constraints: Constraints for the parameters.
+
+    Returns:
+        tuple: Updated state.
+    """
+    # For non-measurement gates, apply the gate without measurement
+    params = clip_params(params, gate_param_constraints)
+    return channel(rho_cav, *[params])
 
 
 def convert_to_index(measurement_history):
@@ -227,12 +247,13 @@ def convert_system_params(system_params):
     param_constraints = []
     c_ops = []
     decay_indices = []
+    channel_indices = []
 
     def _Gate_validity_checks(gate):
         """
         Checks if the provided gate is a valid unitary or POVM element by evaluating it at the initial parameters.
         """
-        if not gate.measurement_flag: # Check if gate is callable on initial parameters and unitary
+        if not gate.measurement_flag and not gate.quantum_channel_flag: # Check if gate is callable on initial parameters and unitary
             unitary = gate.gate(gate.initial_params)
             
             if len(unitary.shape) == 2:
@@ -250,18 +271,41 @@ def convert_system_params(system_params):
 
             else:
                 raise ValueError("The provided gate must be either a unitary matrix or 1.")
-            
-        else: # Check if gate is callable on initial parameters and a valid POVM element
+
+        elif gate.measurement_flag: # Check if gate is callable on initial parameters and a valid POVM element
+            assert gate.quantum_channel_flag == False, "A gate cannot be both a measurement and a quantum channel."
+
+            # Use inspect.signature to determine the number of parameters in the provided callable.
+            sig = signature(gate.gate)
+            if len(sig.parameters) != 2:
+                raise ValueError(
+                    "The Positive operator valued measure gate you supplied must have two arguments. "
+                    "The first argument is the measurement outcome (1, or -1) and the second argument is the list "
+                    "of optimizable parameters for the measurement gate."
+                )
+
             M_0 = gate.gate(-1, gate.initial_params)
             M_1 = gate.gate(1, gate.initial_params)
             
             for M in [M_0, M_1]:
-                assert M.shape[0] == M.shape[1], "The provided measurement operator is not a square matrix."
+                assert M.shape[0] == M.shape[1], "The provided measurement operator must be a square matrix."
 
-                E = M.conj().T @ M
-                assert is_positive_semi_definite(E), "The provided measurement operator M does not satisfy M^† M >= 0 (positive semi-definite)."
+                # redundant: E = M.conj().T @ M >= 0 by construction
+                # E = M.conj().T @ M
+                # assert is_positive_semi_definite(E), "The provided measurement operator M does not satisfy M^† M >= 0 (positive semi-definite)."
 
             assert jnp.allclose(M_0.conj().T @ M_0 + M_1.conj().T @ M_1, jnp.eye(M_0.shape[0])), "The provided measurement operators do not sum to the identity."
+        else: # Quantum channel
+            # Use inspect.signature to validate quantum channel callables
+            sig = signature(gate.gate)
+            if len(sig.parameters) != 2:
+                raise ValueError(
+                    "The quantum channel gate you supplied must have two arguments. "
+                    "The first argument is the density matrix / state vector and the second argument is the list "
+                    "of optimizable parameters for the quantum channel."
+                )
+
+            # Check if the quantum channel works on a state vector or density matrix is not implemented yet
 
     for i, gate_config in enumerate(system_params):
         if hasattr(gate_config, "c_ops"):
@@ -277,19 +321,16 @@ def convert_system_params(system_params):
             else:
                 params = gate_config.initial_params
             is_measurement = gate_config.measurement_flag
+            is_channel = gate_config.quantum_channel_flag
 
             # Add gate to parameterized_gates list
             parameterized_gates.append(gate_func)
 
-            # If this is a measurement gate, add its index
+            # If this is a measurement gate or quantum channel, add its index
             if is_measurement:
-                if gate_func.__code__.co_argcount < 2:
-                    raise ValueError(
-                        "The Positive operator valued measure gate you supplied must have at least two arguments. "
-                        "The first argument is the measurement outcome (1, or -1) and the second argument is the list "
-                        "of optimizable parameters for the measurement gate."
-                    )
                 measurement_indices.append(i)
+            elif is_channel:
+                channel_indices.append(i)
 
             param_name = f"gate_{i}"
 
@@ -313,6 +354,7 @@ def convert_system_params(system_params):
         param_constraints,
         c_ops,
         decay_indices,
+        channel_indices,
     )
 
 

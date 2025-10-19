@@ -379,6 +379,8 @@ def calculate_trajectory(
     # Split rng_key into batch_size keys for independent trajectories
     batch_keys = jax.random.split(rng_key, batch_size)
 
+    depth = len(initial_params)
+
     def _calculate_single_trajectory(
         batch_key,
     ):
@@ -405,7 +407,7 @@ def calculate_trajectory(
                     c_ops=c_ops,
                     decay_indices=decay_indices,
                     channel_indices=channel_indices,
-                    initial_params=new_params[i],
+                    initial_params=new_params[min(i, depth - 1)], # use last params if time_steps > depth for compatibility with evaluate_on_longer_time
                     param_shapes=param_shapes,
                     evo_type=evo_type,
                     time_step_key=time_step_keys[i],
@@ -496,7 +498,7 @@ def optimize_pulse(
     batch_size: int = _DEFAULTS.BATCH_SIZE.value,
     eval_batch_size: int = _DEFAULTS.EVAL_BATCH_SIZE.value,
     mode: str = _DEFAULTS.MODE.value,  # nn, lookup
-    rnn: Callable = _DEFAULTS.RNN.value,  # type: ignore
+    rnn: Callable = _DEFAULTS.RNN.value,
     rnn_hidden_size: int = _DEFAULTS.RNN_HIDDEN_SIZE.value,
     progress: bool = _DEFAULTS.PROGRESS.value,
 ) -> FgResult:
@@ -1016,8 +1018,8 @@ def evaluate_on_longer_time(
     goal: str,  # purity, fidelity, both
     eval_batch_size: int,
     mode: str,  # nn, lookup
-    rnn: Callable,  # type: ignore
-    rnn_hidden_size: int,
+    rnn: Callable = _DEFAULTS.RNN.value,
+    rnn_hidden_size: int = _DEFAULTS.RNN_HIDDEN_SIZE.value,
 ) -> FgResult:
     """
     Optimizes pulse parameters for quantum systems based on the specified configuration using ADAM.
@@ -1052,26 +1054,30 @@ def evaluate_on_longer_time(
 
     if evo_type not in ["state", "density"]:
         raise ValueError("Invalid evo_type. Choose 'state' or 'density'.")
+    
+    # If U_0 or C_target are callables, generate a test state to check their validity
+    U_0_test = U_0(jax.random.PRNGKey(0)) if callable(U_0) else U_0
+    C_target_test = C_target(jax.random.PRNGKey(0)) if callable(C_target) else C_target
 
-    if U_0 is None:
+    if U_0_test is None:
         raise ValueError("Please provide an initial state U_0.")
 
-    if C_target is None and goal in ["fidelity", "both"]:
+    if C_target_test is None and goal in ["fidelity", "both"]:
         raise ValueError(
             "Please provide a target state C_target for fidelity calculation."
         )
 
-    if isbra(U_0) or isbra(C_target):
+    if isbra(U_0_test) or isbra(C_target_test):
         raise TypeError(
             "Please provide initial and target states as kets (column vectors) or density matrices."
         )
-    
-    if evo_type == "state" and not (isket(U_0) and isket(C_target)):
+
+    if evo_type == "state" and not (isket(U_0_test) and isket(C_target_test)):
         raise TypeError(
             "For evo_type='state', please provide initial and target states as kets (column vectors)."
         )
 
-    if evo_type == "density" and (isket(U_0) or isket(C_target)):
+    if evo_type == "density" and (isket(U_0_test) or isket(C_target_test)):
         raise TypeError(
             "For evo_type='density', please provide initial and target states as density matrices."
         )
@@ -1089,8 +1095,8 @@ def evaluate_on_longer_time(
     if (
         evo_type == "density"
         and (
-            not is_positive_semi_definite(U_0)
-            or (goal != "purity" and not is_positive_semi_definite(C_target))
+            not is_positive_semi_definite(U_0_test)
+            or (goal != "purity" and not is_positive_semi_definite(C_target_test))
         )
     ):
         raise TypeError(
@@ -1108,7 +1114,7 @@ def evaluate_on_longer_time(
     ) = convert_system_params(system_params)
 
     if (
-        evo_type == "state" or (isket(U_0) or isket(C_target))
+        evo_type == "state" or (isket(U_0_test) or isket(C_target_test))
     ) and decay_indices != []:
         raise ValueError(
             "Decay requires a density matrix representation of your inital and target states because, the solver uses Lindblad equation to evolve the system with dissipation. \n"
@@ -1137,6 +1143,8 @@ def evaluate_on_longer_time(
 
         # Calculate total number of parameters
         if mode == "nn":
+            assert "rnn_params" in optimized_trainable_parameters, "RNN parameters not found in optimized_trainable_parameters."
+            
             # VERY IMPORTANT: Go through the RNN parameters and convert lists to jnp arrays.
             # Otherwise, flax will throw incomprehensible errors about non-matching shapes.
             def convert_lists_to_jnp(obj):

@@ -1175,6 +1175,18 @@ def evaluate_on_longer_time(
             )  # Initialize RNN parameters
 
         elif mode == "lookup":
+            # Convert lists in lookup table to jnp arrays
+            def convert_lookup_lists_to_jnp(obj):
+                if isinstance(obj, list):
+                    return [jnp.array(item, dtype=jnp.float64) for item in obj]
+                else:
+                    return obj
+            optimized_trainable_parameters["initial_params"] = convert_lookup_lists_to_jnp(
+                optimized_trainable_parameters["initial_params"]
+            )
+            optimized_trainable_parameters['lookup_table'] = [
+                convert_lookup_lists_to_jnp(item) for item in optimized_trainable_parameters['lookup_table'] # type: ignore
+            ]
             h_initial_state = None
             rnn_model = None
         else:

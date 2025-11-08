@@ -1160,6 +1160,7 @@ def evaluate_on_longer_time(
                 else:
                     return obj
             optimized_trainable_parameters['rnn_params'] = convert_lists_to_jnp(optimized_trainable_parameters['rnn_params']) # type: ignore
+            optimized_trainable_parameters['initial_params'] = convert_lists_to_jnp(optimized_trainable_parameters['initial_params'])
 
             hidden_size = rnn_hidden_size
             output_size = num_of_params

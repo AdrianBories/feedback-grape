@@ -2,6 +2,7 @@ import jax
 import optax  # type: ignore
 import optax.tree_utils as otu  # type: ignore
 from time import time
+import numpy as np
 # ruff: noqa N8
 
 jax.config.update("jax_enable_x64", True)
@@ -17,6 +18,7 @@ def optimize_adam_feedback(
     key,
     progress,
     early_stop,
+    opt_state = None, # EXPERIMENTAL
 ):
     """
 
@@ -36,7 +38,7 @@ def optimize_adam_feedback(
         final_iter_idx: Number of iterations in the optimization.
     """
     optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(control_amplitudes)
+    if opt_state is None: opt_state = optimizer.init(control_amplitudes)
     losses = []
 
     @jax.jit
@@ -74,9 +76,9 @@ def optimize_adam_feedback(
             if iter_idx == 0:
                 start_time = time() # Start clock after first iteration which initializes compiled functions
             if iter_idx % 10 == 0 and iter_idx > 0:
-                print(f"Iteration {iter_idx}, Loss: {loss:.6f}, T={int(time() - start_time)}s, eta={int((max_iter - (iter_idx - 1))/(iter_idx + 1)*(time() - start_time))}s")
-
-    return params, iter_idx + 1
+                print(f"Iteration {iter_idx}, Loss (avg over 10): {np.mean(np.array(losses[-10:])):.6f}, T={int(time() - start_time)}s, eta={int((max_iter - (iter_idx - 1))/(iter_idx + 1)*(time() - start_time))}s")
+    print(f"Mean loss {np.mean(np.array(losses))}")
+    return params, iter_idx + 1, opt_state
 
 
 def optimize_adam(

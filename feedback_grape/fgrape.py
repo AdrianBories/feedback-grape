@@ -28,6 +28,7 @@ from .utils.fgrape_helpers import (
     apply_channel,
     RNN,
 )
+from tqdm import tqdm
 
 # Answer: see if I should replace with pmap for feedback-grape gpu version (may also be a different package)
 # Answer: No, both do different things, pmap is for parallelizing over multiple devices, while vmap is for vectorizing over a single device.
@@ -75,6 +76,10 @@ class FgResult(NamedTuple):
     purity_each_timestep: jnp.ndarray | None = None
     """
     Purity of the optimized control along each timestep.
+    """
+    state_each_timestep: jnp.ndarray | None = None
+    """
+    State of the system at each time step.
     """
 
 
@@ -501,6 +506,11 @@ def optimize_pulse(
     rnn: Callable = _DEFAULTS.RNN.value,
     rnn_hidden_size: int = _DEFAULTS.RNN_HIDDEN_SIZE.value,
     progress: bool = _DEFAULTS.PROGRESS.value,
+    train_on_final_states_start: int = 0, # EXPERIMENTAL
+    train_on_final_states_every_a: int = 0, # EXPERIMENTAL
+    train_on_final_states_every_b: int = 0, # EXPERIMENTAL
+    train_eval_num_time_steps: int = 0, # EXPERIMENTAL
+    train_eval_batch_size: int = 0, # EXPERIMENTAL
 ) -> FgResult:
     """
     Optimizes pulse parameters for quantum systems based on the specified configuration using ADAM.
@@ -722,104 +732,149 @@ def optimize_pulse(
                 "Invalid mode. Choose 'nn' or 'lookup' or 'no-measurement'."
             )
 
-    def loss_fn(trainable_params, rng_key):
-        """
-        Loss function for the optimization process.
-        This function calculates the loss based on the specified goal (purity, fidelity, or both).
-        Args:
-            rnn_params: Parameters of the rnn model or lookup table.
-            rng_key: Random key for stochastic operations.
-        Returns:
-            Loss value to be minimized.
-        """
 
-        loss_sum1 = loss_sum2 = 0
+    if train_on_final_states_start == 0: 
+        train_on_final_states_start = max_iter
+        total_epochs = 1
+    else:
+        total_epochs = (max_iter - train_on_final_states_start) // (train_on_final_states_every_a + train_on_final_states_every_b) * 2 + 1
 
-        if mode == "no-measurement":
-            h_initial_state = None
-            rnn_params = None
-            lookup_table_params = None
-            initial_params_opt = trainable_params
-        elif mode == "nn":
-            # reseting hidden state at end of every trajectory ( does not really change the purity tho)
-            h_initial_state = jnp.zeros((1, hidden_size))
-            rnn_params = trainable_params['rnn_params']
-            initial_params_opt = trainable_params['initial_params']
-            lookup_table_params = None
-        elif mode == "lookup":
-            h_initial_state = None
-            rnn_params = None
-            lookup_table_params = trainable_params['lookup_table']
-            initial_params_opt = trainable_params['initial_params']
+    train_key, eval_key, train_key_2 = jax.random.split(train_eval_key, 3)
+    U_0_true = U_0
+    C_target_true = C_target
+    opt_state = None
+    for epoch in tqdm(range(total_epochs)):
+        iterations = train_on_final_states_start if epoch == 0 else train_on_final_states_every_a if epoch % 2 == 0 else train_on_final_states_every_b
 
-        rho_finals, log_probs, _ = calculate_trajectory(
-            rho_cav=U_0,
-            parameterized_gates=parameterized_gates,
-            measurement_indices=measurement_indices,
-            param_constraints=param_constraints,
-            c_ops=c_ops,
-            decay_indices=decay_indices,
-            channel_indices=channel_indices,
-            initial_params=initial_params_opt,
-            param_shapes=param_shapes,
-            time_steps=num_time_steps,
-            rnn_model=rnn_model,
-            rnn_params=rnn_params,
-            rnn_state=h_initial_state,
-            lut=lookup_table_params,
-            evo_type=evo_type,
-            batch_size=batch_size,
-            rng_key=rng_key,
-        ) # type: ignore
-
-        if goal in ["fidelity", "both"]: # Cleaned this up a bit and added weighting
-            # Use the training batch size so C_target_eval aligns with rho_finals (which has leading dim=batch_size)
-            batch_keys = jax.random.split(rng_key, batch_size)
-            if callable(C_target):  # Generate target states with same key as initial states
-                C_target_eval = jax.vmap(C_target)(batch_keys)
-            else:
-                # replicate static C_target to match batch_size
-                C_target_eval = jax.vmap(lambda _: C_target)(batch_keys)
-
-            fidelity_vmap = jax.vmap(
-                lambda ct, rf: fidelity(
-                    C_target=ct, U_final=rf, evo_type=evo_type
-                )
+        if epoch % 2 == 0:
+            U_0_batch = jax.vmap(lambda key: U_0_true(key))(jax.random.split(train_key, 1000)) if callable(U_0_true) else jnp.array([U_0_true])
+            U_0 = lambda key: jax.random.choice(key, U_0_batch)
+            C_target = U_0
+        else:
+            result = _evaluate(
+                U_0=U_0,
+                C_target=C_target,
+                parameterized_gates=parameterized_gates,
+                measurement_indices=measurement_indices,
+                param_constraints=param_constraints,
+                c_ops=c_ops,
+                decay_indices=decay_indices,
+                channel_indices=channel_indices,
+                param_shapes=param_shapes,
+                best_model_params=trainable_params,
+                mode=mode,
+                num_time_steps=train_eval_num_time_steps,
+                evo_type=evo_type,
+                eval_batch_size=train_eval_batch_size,
+                prng_key=train_key_2,
+                h_initial_state=h_initial_state,
+                rnn_model=rnn_model,
+                goal=goal,
+                num_iterations=iter_idx,
             )
 
-            for weight, rf, log_prob in zip(reward_weights, rho_finals[1:], log_probs[1:]):
-                if weight != 0.0: # Supposed to cut branches in jax's computational graph -> less memory usage
-                    fidelity_value = fidelity_vmap(C_target_eval, rf)
-                    loss_sum1 += -weight * jnp.mean(fidelity_value)
-                    loss_sum2 += -weight * jnp.mean(log_prob * jax.lax.stop_gradient(fidelity_value))
-        
-        if goal in ["purity", "both"]:
-            purity_vmap = jax.vmap(purity)
+            U_0 = lambda key: jax.random.choice(key, result.state_each_timestep[-1])
+            C_target = lambda key: jax.random.choice(key, result.state_each_timestep[0])
 
-            for weight, rf, log_prob in zip(reward_weights, rho_finals[1:], log_probs[1:]):
-                if weight != 0.0: # Supposed to cut branches in jax's computational graph -> less memory usage
-                    purity_values = purity_vmap(rho=rf)
-                    loss_sum1 += -weight * jnp.mean(purity_values)
-                    loss_sum2 += -weight * jnp.mean(log_prob * jax.lax.stop_gradient(purity_values))
+        def loss_fn(trainable_params, rng_key):
+            """
+            Loss function for the optimization process.
+            This function calculates the loss based on the specified goal (purity, fidelity, or both).
+            Args:
+                rnn_params: Parameters of the rnn model or lookup table.
+                rng_key: Random key for stochastic operations.
+            Returns:
+                Loss value to be minimized.
+            """
 
-        return loss_sum1 + loss_sum2
+            loss_sum1 = loss_sum2 = 0
 
-    train_key, eval_key = jax.random.split(train_eval_key)
+            if mode == "no-measurement":
+                h_initial_state = None
+                rnn_params = None
+                lookup_table_params = None
+                initial_params_opt = trainable_params
+            elif mode == "nn":
+                # reseting hidden state at end of every trajectory ( does not really change the purity tho)
+                h_initial_state = jnp.zeros((1, hidden_size))
+                rnn_params = trainable_params['rnn_params']
+                initial_params_opt = trainable_params['initial_params']
+                lookup_table_params = None
+            elif mode == "lookup":
+                h_initial_state = None
+                rnn_params = None
+                lookup_table_params = trainable_params['lookup_table']
+                initial_params_opt = trainable_params['initial_params']
 
-    best_model_params, iter_idx = _train(
-        loss_fn=loss_fn,
-        trainable_params=trainable_params,
-        max_iter=max_iter,
-        learning_rate=learning_rate,
-        convergence_threshold=convergence_threshold,
-        prng_key=train_key,
-        progress=progress,
-        early_stop=early_stop,
-    )
+            rho_finals, log_probs, _ = calculate_trajectory(
+                rho_cav=U_0,
+                parameterized_gates=parameterized_gates,
+                measurement_indices=measurement_indices,
+                param_constraints=param_constraints,
+                c_ops=c_ops,
+                decay_indices=decay_indices,
+                channel_indices=channel_indices,
+                initial_params=initial_params_opt,
+                param_shapes=param_shapes,
+                time_steps=num_time_steps,
+                rnn_model=rnn_model,
+                rnn_params=rnn_params,
+                rnn_state=h_initial_state,
+                lut=lookup_table_params,
+                evo_type=evo_type,
+                batch_size=batch_size,
+                rng_key=rng_key,
+            ) # type: ignore
+
+            if goal in ["fidelity", "both"]: # Cleaned this up a bit and added weighting
+                # Use the training batch size so C_target_eval aligns with rho_finals (which has leading dim=batch_size)
+                batch_keys = jax.random.split(rng_key, batch_size)
+                if callable(C_target):  # Generate target states with same key as initial states
+                    C_target_eval = jax.vmap(C_target)(batch_keys)
+                else:
+                    # replicate static C_target to match batch_size
+                    C_target_eval = jax.vmap(lambda _: C_target)(batch_keys)
+
+                fidelity_vmap = jax.vmap(
+                    lambda ct, rf: fidelity(
+                        C_target=ct, U_final=rf, evo_type=evo_type
+                    )
+                )
+
+                for weight, rf, log_prob in zip(reward_weights, rho_finals[1:], log_probs[1:]):
+                    if weight != 0.0: # Supposed to cut branches in jax's computational graph -> less memory usage
+                        fidelity_value = fidelity_vmap(C_target_eval, rf)
+                        loss_sum1 += -weight * jnp.mean(fidelity_value)
+                        loss_sum2 += -weight * jnp.mean(log_prob * jax.lax.stop_gradient(fidelity_value))
+            
+            if goal in ["purity", "both"]:
+                purity_vmap = jax.vmap(purity)
+
+                for weight, rf, log_prob in zip(reward_weights, rho_finals[1:], log_probs[1:]):
+                    if weight != 0.0: # Supposed to cut branches in jax's computational graph -> less memory usage
+                        purity_values = purity_vmap(rho=rf)
+                        loss_sum1 += -weight * jnp.mean(purity_values)
+                        loss_sum2 += -weight * jnp.mean(log_prob * jax.lax.stop_gradient(purity_values))
+
+            return loss_sum1 + loss_sum2
+
+        trainable_params, iter_idx, opt_state = _train(
+            loss_fn=loss_fn,
+            trainable_params=trainable_params,
+            max_iter=iterations,
+            learning_rate=learning_rate,
+            convergence_threshold=convergence_threshold,
+            prng_key=train_key,
+            progress=progress,
+            early_stop=early_stop,
+            opt_state=opt_state,
+        )
+
+        train_key, train_key_2 = jax.random.split(train_key) # update key for next epoch
 
     result = _evaluate(
-        U_0=U_0,
-        C_target=C_target,
+        U_0=U_0_true,
+        C_target=C_target_true,
         parameterized_gates=parameterized_gates,
         measurement_indices=measurement_indices,
         param_constraints=param_constraints,
@@ -827,7 +882,7 @@ def optimize_pulse(
         decay_indices=decay_indices,
         channel_indices=channel_indices,
         param_shapes=param_shapes,
-        best_model_params=best_model_params,
+        best_model_params=trainable_params,
         mode=mode,
         num_time_steps=num_time_steps,
         evo_type=evo_type,
@@ -851,13 +906,14 @@ def _train(
     convergence_threshold,
     progress,
     early_stop,
+    opt_state, # EXPERIMENTAL
 ):
     """
     Train the model using the specified optimizer.
     """
     # Optimization
     # set up optimizer and training state
-    best_model_params, iter_idx = optimize_adam_feedback(
+    best_model_params, iter_idx, opt_state = optimize_adam_feedback(
         loss_fn,
         trainable_params,
         max_iter,
@@ -870,7 +926,7 @@ def _train(
 
     # Due to the complex parameter l-bfgs is very slow and leads to bad results so is omitted
 
-    return best_model_params, iter_idx
+    return best_model_params, iter_idx, opt_state
 
 
 def _evaluate(
@@ -1005,6 +1061,7 @@ def _evaluate(
         fidelity_each_timestep=fidelity_each_timestep, # type: ignore
         iterations=num_iterations,
         final_state=rho_finals[-1],
+        state_each_timestep=rho_finals,
         returned_params=returned_params
     )
 

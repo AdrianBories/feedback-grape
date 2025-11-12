@@ -108,7 +108,7 @@ def apply_channel(rho_cav, channel, params, evo_type, gate_param_constraints):
     return channel(rho_cav, *[params])
 
 
-def convert_to_index(measurement_history):
+def convert_to_index(measurement_history, memory_depth):
     """
 
     Convert measurement history from [1, -1, ...] to [0, 1, ...] and then to an integer index
@@ -124,7 +124,7 @@ def convert_to_index(measurement_history):
     # Convert binary list to integer index (e.g., [0,1] -> 1)
     reversed_binary = binary_history[::-1]
     int_index = jnp.sum(
-        (2 ** jnp.arange(len(reversed_binary))) * reversed_binary
+        ((2 ** jnp.arange(len(reversed_binary))) * reversed_binary)[:memory_depth]
     )
     return int_index
 
@@ -140,8 +140,8 @@ def extract_from_lut(lut, measurement_history):
     Returns:
         Extracted parameters.
     """
-    sub_array_idx = min(len(measurement_history) - 1, len(lut) - 1) # MODIFIED LINE: Uses the last available sub-array if measurement history is longer than lut_depth
-    sub_array_param_idx = convert_to_index(measurement_history) & (2**len(lut) - 1) # MODIFIED LINE. Ignores extra measurements beyond lut_depth.
+    sub_array_idx = min(len(measurement_history) - 1, len(lut) - 1)
+    sub_array_param_idx = convert_to_index(measurement_history, len(lut))
     return jnp.array(lut)[sub_array_idx][sub_array_param_idx]
 
 

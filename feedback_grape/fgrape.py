@@ -76,6 +76,10 @@ class FgResult(NamedTuple):
     """
     Purity of the optimized control along each timestep.
     """
+    state_each_timestep: List[jnp.ndarray] | None = None
+    """
+    Density matrices at each time step.
+    """
 
 
 class _DEFAULTS(Enum):
@@ -1005,7 +1009,8 @@ def _evaluate(
         fidelity_each_timestep=fidelity_each_timestep, # type: ignore
         iterations=num_iterations,
         final_state=rho_finals[-1],
-        returned_params=returned_params
+        returned_params=returned_params,
+        state_each_timestep=rho_finals,
     )
 
 def evaluate_on_longer_time(

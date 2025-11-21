@@ -135,7 +135,7 @@ def _state_density_fidelity(A, B):
         # Take advantage of the fact that the density operator for A
         # is a projector to avoid a sqrtm call.
         A = A / jnp.linalg.norm(A)
-        sqrtmA = ket2dm(A)
+        #sqrtmA = ket2dm(A)
     else:
         if isket(B) or isbra(B):
             # Swap the order so that we can take a more numerically
@@ -146,18 +146,18 @@ def _state_density_fidelity(A, B):
         A = A / jnp.linalg.trace(A)
         B = B / jnp.linalg.trace(B)
 
-        sqrtmA = sqrtm_eig(A)
+        #sqrtmA = sqrtm_eig(A)
         # sqrtmA = jax.scipy.linalg.sqrtm(A)
 
-    if sqrtmA.shape != B.shape:
-        raise TypeError('Density matrices do not have same dimensions.')
+    #if sqrtmA.shape != B.shape:
+    #    raise TypeError('Density matrices do not have same dimensions.')
 
     # We don't actually need the whole matrix here, just the trace
     # of its square root, so let's just get its eigenenergies instead.
     # We also truncate negative eigenvalues to avoid nan propagation;
     # even for positive semidefinite matrices, small negative eigenvalues
     # can be reported. This REALLY HAPPENED!! In example c
-    eig_vals = jnp.linalg.eigvals(sqrtmA @ B @ sqrtmA)
+    eig_vals = jnp.linalg.eigvals(A @ B) # Changed this from sqrtmA@B@sqrtmA to A@B for speedup
     eig_vals_non_neg = jnp.where(eig_vals > 0, eig_vals, 0)
     return jnp.real(jnp.sum(jnp.sqrt(eig_vals_non_neg))) # type: ignore
 

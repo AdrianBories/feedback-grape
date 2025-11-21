@@ -2,7 +2,6 @@
 GRadient Ascent Pulse Engineering (GRAPE) with feedback.
 """
 
-from re import U
 import jax
 from enum import Enum
 import jax.numpy as jnp
@@ -80,6 +79,7 @@ class FgResult(NamedTuple):
     """
     Density matrices at each time step.
     """
+    initial_measurement_history: List[int] | None = None
 
 
 class _DEFAULTS(Enum):
@@ -360,6 +360,7 @@ def calculate_trajectory(
     evo_type,
     batch_size,
     rng_key,
+    initial_measurement_history=[],
 ):
     """
     Calculate a complete quantum trajectory with feedback.
@@ -421,7 +422,7 @@ def calculate_trajectory(
                 rho_finals.append(rho_final)
                 total_log_prob.append(0.0)
         elif lut is not None:
-            measurement_history: list[int] = []
+            measurement_history: list[int] = initial_measurement_history.copy()
             for i in range(time_steps):
                 (
                     rho_final,
@@ -841,6 +842,7 @@ def optimize_pulse(
         rnn_model=rnn_model,
         goal=goal,
         num_iterations=iter_idx,
+        initial_measurement_history=[],
     )
 
     return result
@@ -897,6 +899,7 @@ def _evaluate(
     goal,
     rnn_model,
     num_iterations,
+    initial_measurement_history,
 ):
     """
     Evaluate the model using the best parameters found during training.
@@ -916,6 +919,7 @@ def _evaluate(
             evo_type=evo_type,
             batch_size=eval_batch_size,
             rng_key=prng_key,
+            initial_measurement_history=initial_measurement_history,
         )
     elif mode == "nn":
         rho_finals, _, returned_params = calculate_trajectory(
@@ -935,6 +939,7 @@ def _evaluate(
             evo_type=evo_type,
             batch_size=eval_batch_size,
             rng_key=prng_key,
+            initial_measurement_history=initial_measurement_history,
         )
     elif mode == "lookup":
         rho_finals, _, returned_params = calculate_trajectory(
@@ -952,6 +957,7 @@ def _evaluate(
             evo_type=evo_type,
             batch_size=eval_batch_size,
             rng_key=prng_key,
+            initial_measurement_history=initial_measurement_history,
         )
     else:
         raise ValueError(
@@ -1011,6 +1017,7 @@ def _evaluate(
         final_state=rho_finals[-1],
         returned_params=returned_params,
         state_each_timestep=rho_finals,
+        initial_measurement_history=initial_measurement_history,
     )
 
 def evaluate_on_longer_time(
@@ -1025,6 +1032,7 @@ def evaluate_on_longer_time(
     mode: str,  # nn, lookup
     rnn: Callable = _DEFAULTS.RNN.value,
     rnn_hidden_size: int = _DEFAULTS.RNN_HIDDEN_SIZE.value,
+    initial_measurement_history: list[int] = [],
 ) -> FgResult:
     """
     Optimizes pulse parameters for quantum systems based on the specified configuration using ADAM.
@@ -1096,6 +1104,17 @@ def evaluate_on_longer_time(
         raise ValueError(
             "C_target should not be provided when goal is 'purity'."
         )
+    
+    if len(initial_measurement_history) and mode != "lookup":
+        raise ValueError(
+            "initial_measurement_history is only used in 'lookup' mode."
+        )
+    
+    for m in initial_measurement_history:
+        if m not in [-1, 1]:
+            raise ValueError(
+                "initial_measurement_history must only contain -1s and 1s."
+            )
 
     if (
         evo_type == "density"
@@ -1220,6 +1239,7 @@ def evaluate_on_longer_time(
         rnn_model=rnn_model,
         goal=goal,
         num_iterations=0, # No optimization, just evaluation
+        initial_measurement_history=initial_measurement_history,
     )
 
     return result

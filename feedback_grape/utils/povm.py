@@ -11,8 +11,8 @@ jax.config.update("jax_enable_x64", True)
 def _probability_of_a_measurement_outcome_given_a_certain_state(
     rho_cav,
     measurement_outcome,
-    povm_measure_operator,
-    initial_params,
+    M_plus,
+    M_minus,
     evo_type,
 ):
     """
@@ -21,15 +21,18 @@ def _probability_of_a_measurement_outcome_given_a_certain_state(
     Args:
         rho_cav: Density matrix of the cavity
         measurement_outcome: The measurement outcome
-        povm_measure_operator: The POVM measurement operator
-        initial_params: Parameters for the POVM operator
+        M_plus: The measurement operator for outcome +1
+        M_minus: The measurement operator for outcome -1
         evo_type: Evolution type, either 'state' or 'density_matrix'
 
     Returns:
         Probability of the measurement outcome
     """
-    Mm = povm_measure_operator(measurement_outcome, *[initial_params])
-    Em = Mm.conj().T @ Mm
+    Mm = jnp.where(
+        measurement_outcome == 1,
+        M_plus,
+        M_minus,
+    )
 
     if evo_type == "state":
         if not isket(rho_cav):
@@ -39,7 +42,8 @@ def _probability_of_a_measurement_outcome_given_a_certain_state(
         # Answer: without jnp.real the result is complex and jnp.grad can no longer do it, but are we then losing information? --> No because probability is real
         # and if the math is correct this quality should be real or have very very small imaginary part because its the probability (the .real is essential for jnp.grad to work)
         # just to remove the +0j
-        prob = jnp.real(jnp.vdot(rho_cav, Em @ rho_cav))
+        numerator = Mm @ rho_cav
+        prob = jnp.real(jnp.vdot(numerator, numerator))
     elif evo_type == "density":
         if (
             isket(rho_cav)
@@ -51,7 +55,7 @@ def _probability_of_a_measurement_outcome_given_a_certain_state(
                 "rho_cav must be a density matrix for evo_type 'density'."
             )
         # ANSWER: would jnp.real be useful here? --> it is essential for jnp.grad to work
-        prob = jnp.real(jnp.trace(Em @ rho_cav))
+        prob = jnp.real(jnp.trace(Mm.conj().T @ Mm @ rho_cav))
     else:
         raise ValueError(f"Invalid evo_type: {evo_type}.")
 
@@ -61,8 +65,8 @@ def _probability_of_a_measurement_outcome_given_a_certain_state(
 def _post_measurement_state(
     rho_cav,
     measurement_outcome,
-    povm_measure_operator,
-    initial_params,
+    M_plus,
+    M_minus,
     evo_type,
 ):
     """
@@ -71,24 +75,18 @@ def _post_measurement_state(
     Args:
         rho_cav: Density matrix of the cavity
         measurement_outcome: The measurement outcome
-        povm_measure_operator: The POVM measurement operator
-        initial_params: Parameters for the POVM operator
+        M_plus: The measurement operator for outcome +1
+        M_minus: The measurement operator for outcome -1
         evo_type: Evolution type, either 'state' or 'density_matrix'
 
     Returns:
         Post-measurement state
     """
-    Mm_op = povm_measure_operator(measurement_outcome, *[initial_params])
-    prob = _probability_of_a_measurement_outcome_given_a_certain_state(
-        rho_cav,
-        measurement_outcome,
-        povm_measure_operator,
-        initial_params,
-        evo_type,
+    Mm_op = jnp.where(
+        measurement_outcome == 1,
+        M_plus,
+        M_minus,
     )
-    # QUESTION: should we use jnp.clip here?
-    prob = jnp.maximum(prob, 1e-10)
-    # is denominator sqrted or not?
 
     if evo_type == "state":
         if not isket(rho_cav):
@@ -96,6 +94,7 @@ def _post_measurement_state(
                 "rho_cav must be a ket (column vector) for evo_type 'state'."
             )
         numerator = Mm_op @ rho_cav
+        prob = jnp.real(jnp.vdot(numerator, numerator))
     elif evo_type == "density":
         if (
             isket(rho_cav)
@@ -107,8 +106,11 @@ def _post_measurement_state(
                 "rho_cav must be a density matrix for evo_type 'density'."
             )
         numerator = Mm_op @ rho_cav @ Mm_op.conj().T
+        prob = jnp.real(jnp.trace(numerator))
     else:
         raise ValueError(f"Invalid evo_type: {evo_type}.")
+
+    prob = jnp.maximum(prob, 1e-10)
 
     return numerator / prob
 
@@ -142,16 +144,19 @@ def povm(
         initial_povm_params, gate_param_constraints
     )
 
+    M_plus = povm_measure_operator(1, *[initial_povm_params])
+    M_minus = povm_measure_operator(-1, *[initial_povm_params])
+
     prob_plus = _probability_of_a_measurement_outcome_given_a_certain_state(
-        rho_cav, 1, povm_measure_operator, initial_povm_params, evo_type
+        rho_cav, 1, M_plus, M_minus, evo_type
     )
     random_value = jax.random.uniform(rng_key, shape=())
     measurement = jnp.where(random_value < prob_plus, 1, -1)
     rho_meas = _post_measurement_state(
         rho_cav,
         measurement,
-        povm_measure_operator,
-        initial_povm_params,
+        M_plus,
+        M_minus,
         evo_type,
     )
     prob = jnp.where(

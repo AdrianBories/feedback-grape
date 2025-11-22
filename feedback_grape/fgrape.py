@@ -22,12 +22,15 @@ from .utils.fgrape_helpers import (
     convert_system_params,
     construct_ragged_row,
     extract_from_lut,
+    evaluate_lut_params,
+    _evaluate_params,
+    extract_from_operator_lut,
     reshape_params,
     apply_gate,
     apply_channel,
     RNN,
 )
-
+from tqdm import tqdm
 # Answer: see if I should replace with pmap for feedback-grape gpu version (may also be a different package)
 # Answer: No, both do different things, pmap is for parallelizing over multiple devices, while vmap is for vectorizing over a single device.
 # Answer: Pmap should be used by the user if he has a slurm script that runs grape on multiple devices.
@@ -141,7 +144,9 @@ def _calculate_time_step(
     parameterized_gates,
     measurement_indices,
     initial_params,
+    initial_operators=None,
     param_shapes,
+    operator_shapes=None,
     param_constraints,
     c_ops,
     decay_indices,
@@ -150,6 +155,7 @@ def _calculate_time_step(
     rnn_params=None,
     rnn_state=None,
     lut=None,
+    lut_operators=None,
     measurement_history=None,
     evo_type,
     time_step_key,
@@ -169,10 +175,9 @@ def _calculate_time_step(
 
     if rnn_model is None and lut is None:
         extracted_params = initial_params
+
         # Apply each gate in sequence
         for i in range(len(parameterized_gates) + len(decay_indices)):
-            # Answer: see what would happen if this is a state --> because it will still output rho
-            # Answer: states are now automatically converted to density matrices
             if i in decay_indices:
                 decay_count_so_far += 1
                 if len(jump_operators) == 0:
@@ -203,16 +208,17 @@ def _calculate_time_step(
             rho_final,
             total_log_prob,
             None,
+            None,
             applied_params,
             None,
         )
     elif lut is not None:
         extracted_lut_params = initial_params
+        extracted_lut_operators = initial_operators
+        channel_count_so_far = 0
 
         # Apply each gate in sequence
         for i in range(len(parameterized_gates) + len(decay_indices)):
-            # Answer: see what would happen if this is a state --> because it will still output rho
-            # Answer: states are now automatically converted to density matrices
             key, subkey = jax.random.split(key)
             if i in decay_indices:
                 decay_count_so_far += 1
@@ -225,9 +231,22 @@ def _calculate_time_step(
                     rho0=rho_final,
                 )
             elif i in measurement_indices:
+                if extracted_lut_operators is not None:
+                    M_plus_minus = extracted_lut_operators[i - decay_count_so_far - channel_count_so_far]
+                    def povm_measure_operator(meas, _):
+                        height = M_plus_minus.shape[0] // 2
+                        M_plus = M_plus_minus[:height, :]
+                        M_minus = M_plus_minus[height:, :]
+
+                        return jnp.where(
+                            meas == 1, M_plus, M_minus
+                        )
+                else:
+                    povm_measure_operator = parameterized_gates[i - decay_count_so_far]
+
                 rho_final, measurement, log_prob = povm(
                     rho_final,
-                    parameterized_gates[i - decay_count_so_far],
+                    povm_measure_operator,
                     extracted_lut_params[i - decay_count_so_far],
                     gate_param_constraints=param_constraints[
                         i - decay_count_so_far
@@ -241,6 +260,14 @@ def _calculate_time_step(
                 applied_params.append(
                     extracted_lut_params[i - decay_count_so_far]
                 )
+
+                if lut_operators is not None:
+                    extracted_lut_operators = extract_from_operator_lut(
+                        lut_operators, measurement_history
+                    )
+                    extracted_lut_operators = reshape_params(
+                        operator_shapes, extracted_lut_operators
+                    )
                 extracted_lut_params = extract_from_lut(
                     lut, measurement_history
                 )
@@ -248,12 +275,33 @@ def _calculate_time_step(
                     param_shapes, extracted_lut_params
                 )
                 total_log_prob += log_prob
-            else:
-                apply_op = apply_gate if i not in channel_indices else apply_channel
-    
-                rho_final = apply_op(
+            elif i in channel_indices:
+                rho_final = apply_channel(
                     rho_final,
                     parameterized_gates[i - decay_count_so_far],
+                    extracted_lut_params[i - decay_count_so_far],
+                    evo_type,
+                    gate_param_constraints=param_constraints[
+                        i - decay_count_so_far
+                    ]
+                    if param_constraints != []
+                    else [],
+                )
+                applied_params.append(
+                    extracted_lut_params[i - decay_count_so_far]
+                )
+
+                channel_count_so_far += 1
+            else:
+                if extracted_lut_operators is not None:
+                    op = extracted_lut_operators[i - decay_count_so_far - channel_count_so_far]
+                    gate = lambda _ : op
+                else:
+                    gate = parameterized_gates[i - decay_count_so_far]
+
+                rho_final = apply_gate(
+                    rho_final,
+                    gate,
                     extracted_lut_params[i - decay_count_so_far],
                     evo_type,
                     gate_param_constraints=param_constraints[
@@ -270,6 +318,7 @@ def _calculate_time_step(
             rho_final,
             total_log_prob,
             extracted_lut_params,
+            extracted_lut_operators,
             applied_params,
             measurement_history,
         )
@@ -336,6 +385,7 @@ def _calculate_time_step(
             rho_final,
             total_log_prob,
             updated_params,
+            None,
             applied_params,
             new_hidden_state,
         )
@@ -347,7 +397,9 @@ def calculate_trajectory(
     parameterized_gates,
     measurement_indices,
     initial_params,
+    initial_operators,
     param_shapes,
+    operator_shapes,
     param_constraints,
     c_ops,
     decay_indices,
@@ -357,6 +409,7 @@ def calculate_trajectory(
     rnn_params=None,
     rnn_state=None,
     lut=None,
+    lut_operators=None,
     evo_type,
     batch_size,
     rng_key,
@@ -402,6 +455,7 @@ def calculate_trajectory(
                     rho_final,
                     _,
                     _,
+                    _,
                     applied_params,
                     _,
                 ) = _calculate_time_step(
@@ -422,12 +476,15 @@ def calculate_trajectory(
                 rho_finals.append(rho_final)
                 total_log_prob.append(0.0)
         elif lut is not None:
+            new_operators = initial_operators
+
             measurement_history: list[int] = initial_measurement_history.copy()
             for i in range(time_steps):
                 (
                     rho_final,
                     log_prob,
                     new_params,
+                    new_operators,
                     applied_params,
                     measurement_history,
                 ) = _calculate_time_step(
@@ -439,8 +496,11 @@ def calculate_trajectory(
                     decay_indices=decay_indices,
                     channel_indices=channel_indices,
                     initial_params=new_params,
+                    initial_operators=new_operators,
                     param_shapes=param_shapes,
+                    operator_shapes=operator_shapes,
                     lut=lut,
+                    lut_operators=lut_operators,
                     measurement_history=measurement_history,
                     evo_type=evo_type,
                     time_step_key=time_step_keys[i],
@@ -457,6 +517,7 @@ def calculate_trajectory(
                     rho_final,
                     log_prob,
                     new_params,
+                    _,
                     applied_params,
                     new_hidden_state,
                 ) = _calculate_time_step(
@@ -648,6 +709,8 @@ def optimize_pulse(
         # If no feedback is used, we can just use the initial parameters
         h_initial_state = None
         rnn_model = None
+        operator_shapes = None
+
         trainable_params = get_trainable_parameters_for_no_meas(
             initial_params, param_constraints, num_time_steps, no_meas_key
         )
@@ -669,6 +732,7 @@ def optimize_pulse(
         if mode == "nn":
             hidden_size = rnn_hidden_size
             output_size = num_of_params
+            operator_shapes = None
 
             rnn_model = rnn(hidden_size=hidden_size, output_size=output_size)  # type: ignore
 
@@ -722,6 +786,16 @@ def optimize_pulse(
                 'lookup_table': F,
                 'initial_params': flat_params,
             }
+
+            _, operator_shapes = _evaluate_params( # call once to get operator shapes
+                flat_params,
+                parameterized_gates,
+                decay_indices,
+                measurement_indices,
+                channel_indices,
+                param_constraints,
+            )
+            operator_shapes = [(int(w), int(h)) for w, h in operator_shapes]
         else:
             raise ValueError(
                 "Invalid mode. Choose 'nn' or 'lookup' or 'no-measurement'."
@@ -741,12 +815,16 @@ def optimize_pulse(
         loss_sum1 = loss_sum2 = 0
 
         if mode == "no-measurement":
+            initial_operators = None
+            lut_operators = None
             h_initial_state = None
             rnn_params = None
             lookup_table_params = None
             initial_params_opt = trainable_params
         elif mode == "nn":
             # reseting hidden state at end of every trajectory ( does not really change the purity tho)
+            initial_operators = None
+            lut_operators = None
             h_initial_state = jnp.zeros((1, hidden_size))
             rnn_params = trainable_params['rnn_params']
             initial_params_opt = trainable_params['initial_params']
@@ -757,6 +835,20 @@ def optimize_pulse(
             lookup_table_params = trainable_params['lookup_table']
             initial_params_opt = trainable_params['initial_params']
 
+            (
+                initial_operators,
+                lut_operators,
+            ) = evaluate_lut_params( # Evaluate parametrized gates once for all measurement histories
+                initial_params_opt,
+                lookup_table_params,
+                parameterized_gates,
+                decay_indices,
+                measurement_indices,
+                channel_indices,
+                param_constraints,
+                param_shapes,
+            )
+
         rho_finals, log_probs, _ = calculate_trajectory(
             rho_cav=U_0,
             parameterized_gates=parameterized_gates,
@@ -766,12 +858,15 @@ def optimize_pulse(
             decay_indices=decay_indices,
             channel_indices=channel_indices,
             initial_params=initial_params_opt,
+            initial_operators=initial_operators,
             param_shapes=param_shapes,
+            operator_shapes=operator_shapes,
             time_steps=num_time_steps,
             rnn_model=rnn_model,
             rnn_params=rnn_params,
             rnn_state=h_initial_state,
             lut=lookup_table_params,
+            lut_operators=lut_operators,
             evo_type=evo_type,
             batch_size=batch_size,
             rng_key=rng_key,
@@ -832,6 +927,7 @@ def optimize_pulse(
         decay_indices=decay_indices,
         channel_indices=channel_indices,
         param_shapes=param_shapes,
+        operator_shapes=operator_shapes,
         best_model_params=best_model_params,
         mode=mode,
         num_time_steps=num_time_steps,
@@ -885,6 +981,7 @@ def _evaluate(
     parameterized_gates,
     measurement_indices,
     param_shapes,
+    operator_shapes,
     param_constraints,
     c_ops,
     decay_indices,
@@ -914,7 +1011,10 @@ def _evaluate(
             decay_indices=decay_indices,
             channel_indices=channel_indices,
             initial_params=best_model_params,
+            initial_operators=None,
             param_shapes=param_shapes,
+            operator_shapes=None,
+            lut_operators=None,
             time_steps=num_time_steps,
             evo_type=evo_type,
             batch_size=eval_batch_size,
@@ -931,7 +1031,10 @@ def _evaluate(
             decay_indices=decay_indices,
             channel_indices=channel_indices,
             initial_params=best_model_params['initial_params'],
+            initial_operators=None,
+            lut_operators=None,
             param_shapes=param_shapes,
+            operator_shapes=None,
             time_steps=num_time_steps,
             rnn_model=rnn_model,
             rnn_params=best_model_params['rnn_params'],
@@ -942,6 +1045,20 @@ def _evaluate(
             initial_measurement_history=initial_measurement_history,
         )
     elif mode == "lookup":
+        (
+            initial_operators,
+            lut_operators,
+        ) = evaluate_lut_params( # Evaluate parametrized gates once for all measurement histories
+            best_model_params['initial_params'],
+            best_model_params['lookup_table'],
+            parameterized_gates,
+            decay_indices,
+            measurement_indices,
+            channel_indices,
+            param_constraints,
+            param_shapes,
+        )
+        
         rho_finals, _, returned_params = calculate_trajectory(
             rho_cav=U_0,
             parameterized_gates=parameterized_gates,
@@ -951,9 +1068,12 @@ def _evaluate(
             decay_indices=decay_indices,
             channel_indices=channel_indices,
             initial_params=best_model_params['initial_params'],
+            initial_operators=initial_operators,
             param_shapes=param_shapes,
+            operator_shapes=operator_shapes,
             time_steps=num_time_steps,
             lut=best_model_params['lookup_table'],
+            lut_operators=lut_operators,
             evo_type=evo_type,
             batch_size=eval_batch_size,
             rng_key=prng_key,
@@ -1152,6 +1272,7 @@ def evaluate_on_longer_time(
         # If no feedback is used, we can just use the initial parameters
         h_initial_state = None
         rnn_model = None
+        operator_shapes = None
 
         if not (measurement_indices == [] or measurement_indices is None):
             raise ValueError(
@@ -1198,6 +1319,8 @@ def evaluate_on_longer_time(
             rnn_model.init(
                 jax.random.PRNGKey(0), dummy_input, h_initial_state
             )  # Initialize RNN parameters
+            
+            operator_shapes = None
 
         elif mode == "lookup":
             # Convert lists in lookup table to jnp arrays
@@ -1212,6 +1335,17 @@ def evaluate_on_longer_time(
             optimized_trainable_parameters['lookup_table'] = [
                 convert_lookup_lists_to_jnp(item) for item in optimized_trainable_parameters['lookup_table'] # type: ignore
             ]
+
+            _, operator_shapes = _evaluate_params( # call once to get operator shapes
+                optimized_trainable_parameters["initial_params"],
+                parameterized_gates,
+                decay_indices,
+                measurement_indices,
+                channel_indices,
+                param_constraints,
+            )
+            operator_shapes = [(int(w), int(h)) for w, h in operator_shapes]
+
             h_initial_state = None
             rnn_model = None
         else:
@@ -1229,6 +1363,7 @@ def evaluate_on_longer_time(
         decay_indices=decay_indices,
         channel_indices=channel_indices,
         param_shapes=param_shapes,
+        operator_shapes=operator_shapes,
         best_model_params=optimized_trainable_parameters,
         mode=mode,
         num_time_steps=num_time_steps,

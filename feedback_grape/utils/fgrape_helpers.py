@@ -1,8 +1,10 @@
+import operator
 import jax
 import numpy as np
 from inspect import signature # Use inspect.signature to determine the number of parameters in the provided callable.
 import flax.linen as nn
 import jax.numpy as jnp
+from pytest import param
 from .fidelity import is_positive_semi_definite
 # ruff: noqa N8
 
@@ -88,6 +90,7 @@ def apply_gate(rho_cav, gate, params, evo_type, gate_param_constraints):
         rho_meas = operator @ rho_cav
     return rho_meas
 
+
 def apply_channel(rho_cav, channel, params, evo_type, gate_param_constraints):
     """
     Apply a quantum channel to the given state. This also clips the parameters
@@ -145,7 +148,24 @@ def extract_from_lut(lut, measurement_history):
     return jnp.array(lut)[sub_array_idx][sub_array_param_idx]
 
 
-def reshape_params(param_shapes, rnn_flattened_params):
+def extract_from_operator_lut(lut_operators, measurement_history):
+    """
+    Extract operators from the lookup table based on the measurement history.
+
+    Args:
+        lut_operators: Lookup table for operators.
+        measurement_history: History of measurements.
+
+    Returns:
+        Extracted operators.
+    """
+    sub_array_idx = min(len(measurement_history) - 1, len(lut_operators) - 1)
+    sub_array_param_idx = convert_to_index(measurement_history, len(lut_operators))
+    lut_operators[sub_array_idx]
+    return lut_operators[sub_array_idx][sub_array_param_idx]
+
+
+def reshape_params(param_shapes, flattened_params):
     """
     Reshape the parameters for the gates.
     """
@@ -156,7 +176,7 @@ def reshape_params(param_shapes, rnn_flattened_params):
     for shape in param_shapes:
         num_params = int(np.prod(shape))
         # rnn outputs a flat list, this takes each and assigns according to the shape
-        gate_params = rnn_flattened_params[
+        gate_params = flattened_params[
             param_idx : param_idx + num_params
         ].reshape(shape)
         reshaped_params.append(gate_params)
@@ -407,3 +427,109 @@ def get_trainable_parameters_for_no_meas(
             trainable_params.append(flat_params)
 
     return trainable_params
+
+
+def _evaluate_params(params, parameterized_gates, decay_indices, measurement_indices, channel_indices, param_constraints):
+        lut_operators_item = []
+        decay_count_so_far = 0
+        operator_shapes = []
+
+        # Apply each gate in sequence
+        for i in range(len(parameterized_gates) + len(decay_indices)):
+            if i in decay_indices:
+                decay_count_so_far += 1
+            elif i in measurement_indices:
+                povm_params = clip_params(
+                    params[i - decay_count_so_far],
+                    param_constraints[i - decay_count_so_far]
+                    if param_constraints != []
+                    else []
+                )
+                    
+                povm_fun = parameterized_gates[i - decay_count_so_far]
+                M_plus = povm_fun(1, *[povm_params])
+                M_minus = povm_fun(-1, *[povm_params])
+                M_plus_minus = jnp.vstack([M_plus, M_minus])
+                lut_operators_item.append(M_plus_minus)
+
+                operator_shapes.append(M_plus_minus.shape) # assumes M_plus and M_minus have the same shape
+            elif i not in channel_indices:
+                gate = parameterized_gates[i - decay_count_so_far]
+                params = params[i - decay_count_so_far]
+                params = clip_params(params,
+                    param_constraints[i - decay_count_so_far]
+                    if param_constraints != []
+                    else []
+                )
+                op = gate(*[params])
+                lut_operators_item.append(op)
+                operator_shapes.append(op.shape)
+
+        return lut_operators_item, operator_shapes
+
+
+def evaluate_lut_params(
+    initial_params,
+    lut,
+    parameterized_gates,
+    decay_indices,
+    measurement_indices,
+    channel_indices,
+    param_constraints,
+    param_shapes,
+):
+    """
+    Evaluates all operators in the lookup table with the provided parameters, so that it does not have to be done
+    repeatedly during the simulation.
+    
+    Returns a lookup table with the evaluated operators (jnp.ndarray).
+    """
+    lut_operators = []
+    for col in range(len(lut)):
+        lut_operators_col = []
+
+        for j in range(2**(col + 1)): # Loop through all possible measurement histories of length col + 1
+            # Update measurement history based on binary representation of j
+            bit_str = format(j, f'0{col + 1}b')
+            measurement_history = [1 if bit == '0' else -1 for bit in bit_str]
+
+            # Extract parameters from LUT for the current measurement history
+            extracted_lut_params = extract_from_lut(
+                lut, measurement_history
+            )
+            extracted_lut_params = reshape_params(
+                param_shapes, extracted_lut_params
+            )
+
+            lut_operators_item, _ = _evaluate_params(
+                extracted_lut_params,
+                parameterized_gates,
+                decay_indices,
+                measurement_indices,
+                channel_indices,
+                param_constraints,
+            )
+
+            # Flatten the list of operators
+            lut_operators_item = jnp.concatenate([op.flatten() for op in lut_operators_item])
+            lut_operators_col.append(lut_operators_item)
+
+        lut_operators_col = jnp.pad( # pad with zeros to make all columns the same size
+            jnp.array(lut_operators_col),
+            ((0, 2**(len(lut)) - 2**(col + 1)), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+
+        lut_operators.append(lut_operators_col)
+
+    initial_operators, _ = _evaluate_params(
+        initial_params,
+        parameterized_gates,
+        decay_indices,
+        measurement_indices,
+        channel_indices,
+        param_constraints,
+    ) # initial_operators, not flattened
+
+    return initial_operators, lut_operators

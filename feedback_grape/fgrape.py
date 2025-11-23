@@ -847,6 +847,7 @@ def optimize_pulse(
                 channel_indices,
                 param_constraints,
                 param_shapes,
+                operator_shapes=operator_shapes,
             )
 
         rho_finals, log_probs, _ = calculate_trajectory(
@@ -1057,6 +1058,7 @@ def _evaluate(
             channel_indices,
             param_constraints,
             param_shapes,
+            operator_shapes,
         )
         
         rho_finals, _, returned_params = calculate_trajectory(

@@ -54,8 +54,13 @@ def _probability_of_a_measurement_outcome_given_a_certain_state(
             raise TypeError(
                 "rho_cav must be a density matrix for evo_type 'density'."
             )
-        # ANSWER: would jnp.real be useful here? --> it is essential for jnp.grad to work
-        prob = jnp.real(jnp.trace(Mm.conj().T @ Mm @ rho_cav))
+        
+        #prob = jnp.real(jnp.trace(Mm.conj().T @ Mm @ rho_cav))
+
+        # 2x faster because it only evaluates diagonal elements
+        # of second matrix multiplication before taking trace,
+        # hence saving one full matrix multiplication.
+        prob = jnp.real(jnp.vdot(Mm, Mm @ rho_cav))
     else:
         raise ValueError(f"Invalid evo_type: {evo_type}.")
 
@@ -67,6 +72,7 @@ def _post_measurement_state(
     measurement_outcome,
     M_plus,
     M_minus,
+    prob_plus,
     evo_type,
 ):
     """
@@ -87,6 +93,11 @@ def _post_measurement_state(
         M_plus,
         M_minus,
     )
+    prob = jnp.where(
+        measurement_outcome == 1,
+        prob_plus,
+        1 - prob_plus,
+    )
 
     if evo_type == "state":
         if not isket(rho_cav):
@@ -94,7 +105,6 @@ def _post_measurement_state(
                 "rho_cav must be a ket (column vector) for evo_type 'state'."
             )
         numerator = Mm_op @ rho_cav
-        prob = jnp.real(jnp.vdot(numerator, numerator))
     elif evo_type == "density":
         if (
             isket(rho_cav)
@@ -106,7 +116,6 @@ def _post_measurement_state(
                 "rho_cav must be a density matrix for evo_type 'density'."
             )
         numerator = Mm_op @ rho_cav @ Mm_op.conj().T
-        prob = jnp.real(jnp.trace(numerator))
     else:
         raise ValueError(f"Invalid evo_type: {evo_type}.")
 
@@ -151,20 +160,21 @@ def povm(
         rho_cav, 1, M_plus, M_minus, evo_type
     )
     random_value = jax.random.uniform(rng_key, shape=())
-    measurement = jnp.where(random_value < prob_plus, 1, -1)
+    measurement_outcome = jnp.where(random_value < prob_plus, 1, -1)
     rho_meas = _post_measurement_state(
         rho_cav,
-        measurement,
+        measurement_outcome,
         M_plus,
         M_minus,
+        prob_plus,
         evo_type,
     )
     prob = jnp.where(
-        measurement == 1,
+        measurement_outcome == 1,
         prob_plus,
         1 - prob_plus,
     )
     # QUESTION: If prob is 0 though then the log prob is -inf ( and 1e-10 will be a very huge number)
     # ANSWER: No, it will be log(1e-10) = -23 which should be okay.
     log_prob = jnp.log(jnp.maximum(prob, 1e-10))
-    return rho_meas, measurement, log_prob
+    return rho_meas, measurement_outcome, log_prob

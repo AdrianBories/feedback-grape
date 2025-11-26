@@ -440,29 +440,28 @@ def _evaluate_params(params, parameterized_gates, decay_indices, measurement_ind
 
         if not force_evaluate_all:
             if msmt_idx > 0:
-                start_idx = measurement_indices[msmt_idx - 1] + 1 # evaluate from the gate after the last measurement
-            if msmt_idx < len(measurement_indices):
-                stop_idx = measurement_indices[msmt_idx] + 1 # evaluate up to and including the next measurement
+                start_idx = measurement_indices[(msmt_idx - 1) % len(measurement_indices)] + 1 # evaluate from the gate after the last measurement
+            if msmt_idx % len(measurement_indices) == 0:
+                stop_idx = measurement_indices[0] + 1 # loop from end of gate sequency to the start and evaluate up to and including the first measurement
+            else:
+                stop_idx = measurement_indices[msmt_idx % len(measurement_indices)] + 1 # evaluate up to and including the next measurement
 
         assert start_idx == 0 or operator_shapes_prev is not None, "For start_idx>0, operator_shapes_prev must be provided to reshape the parameters correctly."
         assert stop_idx == len(parameterized_gates) + len(decay_indices) or operator_shapes is not None, "For stop_idx < len(parameterized_gates) + len(decay_indices), operator_shapes must be provided to reshape the parameters correctly."
 
+        if start_idx >= stop_idx:
+            evaluation_indices = list(range(start_idx, stop_idx))
+        else:
+            evaluation_indices = list(range(start_idx, len(parameterized_gates) + len(decay_indices))) + list(range(0, stop_idx))
+
+        # Apply each gate in sequence
         decay_count_so_far = 0
         channels_so_far = 0
-        for i in range(0, start_idx):
-            if i in decay_indices:
-                decay_count_so_far += 1 # skip as it is not parametrized
-            elif i in channel_indices:
-                channels_so_far += 1 # skip as it can not be represented in the LUT
-            else:
+        for i in range(0, len(parameterized_gates) + len(decay_indices)):
+            if i not in evaluation_indices:
                 shape = operator_shapes_prev[i - decay_count_so_far - channels_so_far]
                 lut_operators_item.append(jnp.zeros(shape))  # Placeholder for operators which will never be used
                 operator_shapes.append(shape)
-
-        # Apply each gate in sequence
-        for i in range(start_idx, stop_idx):
-            if i in decay_indices:
-                decay_count_so_far += 1
             elif i in measurement_indices:
                 povm_params = clip_params(
                     params[i - decay_count_so_far],
@@ -489,18 +488,11 @@ def _evaluate_params(params, parameterized_gates, decay_indices, measurement_ind
                 op = gate(*[params])
                 lut_operators_item.append(op)
                 operator_shapes.append(op.shape)
-            else:
-                channels_so_far += 1 # skip as it can not be represented in the LUT
 
-        for i in range(stop_idx, len(parameterized_gates) + len(decay_indices)):
             if i in decay_indices:
                 decay_count_so_far += 1 # skip as it is not parametrized
             elif i in channel_indices:
                 channels_so_far += 1 # skip as it can not be represented in the LUT
-            else:
-                shape = operator_shapes_prev[i - decay_count_so_far - channels_so_far]
-                lut_operators_item.append(jnp.zeros(shape))  # Placeholder for operators which will never be used
-                operator_shapes.append(shape)
 
         return lut_operators_item, operator_shapes
 
@@ -546,7 +538,7 @@ def evaluate_lut_params(
                 measurement_indices,
                 channel_indices,
                 param_constraints,
-                msmt_idx=col+1,
+                msmt_idx=col+1, # Add 1 because one msmt is done by "initial_operators"
                 operator_shapes_prev=operator_shapes,
                 force_evaluate_all=col == len(lut) - 1,
             )

@@ -30,7 +30,7 @@ from .utils.fgrape_helpers import (
     apply_channel,
     RNN,
 )
-from tqdm import tqdm
+
 # Answer: see if I should replace with pmap for feedback-grape gpu version (may also be a different package)
 # Answer: No, both do different things, pmap is for parallelizing over multiple devices, while vmap is for vectorizing over a single device.
 # Answer: Pmap should be used by the user if he has a slurm script that runs grape on multiple devices.

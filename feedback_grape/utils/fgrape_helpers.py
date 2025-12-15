@@ -1,11 +1,8 @@
-import operator
-from tracemalloc import stop
 import jax
 import numpy as np
 from inspect import signature # Use inspect.signature to determine the number of parameters in the provided callable.
 import flax.linen as nn
 import jax.numpy as jnp
-from pytest import param
 from .fidelity import is_positive_semi_definite
 # ruff: noqa N8
 

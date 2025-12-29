@@ -3,6 +3,7 @@ Module for solving the time-dependent Schrödinger equation and master equation
 """
 
 # ruff: noqa N8
+from re import X
 import jax
 import jax.numpy as jnp
 
@@ -61,14 +62,44 @@ def mesolve(*, jump_ops, rho0, H=None, tsave=jnp.linspace(0, 1, 2)):
             for _ in range(len(tsave))
         ]
     rho0 = jnp.asarray(rho0, dtype=jnp.complex128)
-    return (
-        mesolve_dynamiqs(
-            H=H,
-            jump_ops=jump_ops,
-            rho0=rho0,
-            tsave=tsave,
-            options = dq.Options(
-                save_states = False,
-            )
-        ).final_state
-    )[-1].data
+    result = mesolve_dynamiqs(
+        H=H,
+        jump_ops=jump_ops,
+        rho0=rho0,
+        tsave=tsave,
+        options = dq.Options(
+            save_states = False,
+        )
+    )
+
+    return result.final_state[-1].data
+
+def __lindblad_rhs(t, rho, H, Ls):
+    comm = H @ rho - rho @ H
+    drho = -1j * comm
+    for L in Ls:
+        Lrho = L @ rho
+        drho += Lrho @ L.conj().T \
+                - 0.5 * (L.conj().T @ L @ rho + rho @ L.conj().T @ L)
+    return drho
+
+def __rk4_step(f, y, t, dt, *args):
+    """One RK4 step for y' = f(t, y, *args)."""
+    k1 = f(t,         y,             *args)
+    k2 = f(t + dt/2., y + dt/2.*k1,  *args)
+    k3 = f(t + dt/2., y + dt/2.*k2,  *args)
+    k4 = f(t + dt,    y + dt*k3,     *args)
+    return y + dt/6.*(k1 + 2*k2 + 2*k3 + k4)
+
+def lindblad_rk4(rho0, Ls):
+    ts = jnp.linspace(0,1,100)
+    H = 0.0
+
+    def f(t, rho, H, Ls):
+        return __lindblad_rhs(t, rho, H, Ls)
+
+    rho = rho0
+    for i in range(len(ts)-1):
+        dt = ts[i+1] - ts[i]
+        rho = __rk4_step(f, rho, ts[i], dt, H, Ls)
+    return rho

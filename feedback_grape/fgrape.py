@@ -6,7 +6,7 @@ from types import NoneType
 import jax
 from enum import Enum
 import jax.numpy as jnp
-from .utils.solver import mesolve
+from .utils.solver import lindblad_rk4
 from typing import List, NamedTuple
 from .utils.optimizers import optimize_adam_feedback
 from .utils.fidelity import (
@@ -167,9 +167,13 @@ def _calculate_time_step(
                     raise ValueError(
                         "No Corressponding collapse operators for this time step."
                     )
-                rho_final = mesolve(
-                    jump_ops=jump_operators.pop(0),
-                    rho0=rho_final,
+                #rho_final = mesolve(
+                #    jump_ops=jump_operators.pop(0),
+                #    rho0=rho_final,
+                #)
+                rho_final = lindblad_rk4( # 100 steps hardcoded for testing
+                    rho=rho_final,
+                    Ls=jump_operators,
                 )
             else:
                 rho_final = apply_gate(

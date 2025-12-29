@@ -75,8 +75,9 @@ def mesolve(*, jump_ops, rho0, H=None, tsave=jnp.linspace(0, 1, 2)):
     return result.final_state[-1].data
 
 def __lindblad_rhs(t, rho, H, Ls):
-    comm = H @ rho - rho @ H
-    drho = -1j * comm
+    #comm = H @ rho - rho @ H (No unitary part for now)
+    #drho = comm
+    drho = jnp.zeros_like(rho, dtype=jnp.complex128)
     for L in Ls:
         Lrho = L @ rho
         drho += Lrho @ L.conj().T \
@@ -92,7 +93,7 @@ def __rk4_step(f, y, t, dt, *args):
     return y + dt/6.*(k1 + 2*k2 + 2*k3 + k4)
 
 def lindblad_rk4(rho0, Ls):
-    ts = jnp.linspace(0,1,100)
+    ts = jnp.linspace(0,1,20) # Time steps
     H = 0.0
 
     def f(t, rho, H, Ls):

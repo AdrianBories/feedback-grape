@@ -171,9 +171,9 @@ def _calculate_time_step(
                 #    jump_ops=jump_operators.pop(0),
                 #    rho0=rho_final,
                 #)
-                rho_final = lindblad_rk4( # 100 steps hardcoded for testing
-                    rho=rho_final,
-                    Ls=jump_operators,
+                rho_final = lindblad_rk4( # 20 steps hardcoded for testing
+                    rho0=rho_final,
+                    Ls=jump_operators.pop(0),
                 )
             else:
                 rho_final = apply_gate(
@@ -209,9 +209,13 @@ def _calculate_time_step(
                     raise ValueError(
                         "No Corressponding collapse operators for this time step."
                     )
-                rho_final = mesolve(
-                    jump_ops=jump_operators.pop(0),
+                #rho_final = mesolve(
+                #    jump_ops=jump_operators.pop(0),
+                #    rho0=rho_final,
+                #)
+                rho_final = lindblad_rk4( # 20 steps hardcoded for testing
                     rho0=rho_final,
+                    Ls=jump_operators.pop(0),
                 )
             elif i in measurement_indices:
                 rho_final, measurement, log_prob = povm(
@@ -276,9 +280,13 @@ def _calculate_time_step(
                     raise ValueError(
                         "No Corressponding collapse operators for this time step."
                     )
-                rho_final = mesolve(
-                    jump_ops=jump_operators.pop(0),
+                #rho_final = mesolve(
+                #    jump_ops=jump_operators.pop(0),
+                #    rho0=rho_final,
+                #)
+                rho_final = lindblad_rk4( # 20 steps hardcoded for testing
                     rho0=rho_final,
+                    Ls=jump_operators.pop(0),
                 )
             elif i in measurement_indices:
                 rho_final, measurement, log_prob = povm(

@@ -58,11 +58,11 @@ class FgResult(NamedTuple):
     """
     Array of final parameters for each time step.
     """
-    final_purity: jnp.ndarray | None
+    final_purity: float | None
     """
     Final purity of the optimized control.
     """
-    final_fidelity: jnp.ndarray | None
+    final_fidelity: float | None
     """
     Final fidelity of the optimized control.
     """
@@ -88,7 +88,7 @@ class Gate(NamedTuple):
     """
     Function that applies the gate to the state.
     """
-    initial_params: list[float]
+    initial_params: list[float] | jnp.ndarray
     """
     Initial parameters for the gate.
     """
@@ -455,11 +455,11 @@ def calculate_trajectory(
 
 def optimize_pulse(
     U_0: jnp.ndarray,
-    C_target: jnp.ndarray,
-    system_params: list[Gate],
+    C_target: jnp.ndarray | None,
+    system_params: list[Gate | Decay] | list[Gate],
     num_time_steps: int,
     max_iter: int,
-    convergence_threshold: float,
+    convergence_threshold: float | None,
     learning_rate: float,
     evo_type: str,  # state, density (used now mainly for fidelity calculation)
     goal: str = _DEFAULTS.GOAL.value,  # purity, fidelity, both
@@ -499,61 +499,26 @@ def optimize_pulse(
     Returns:
         result: Dictionary containing optimized pulse and convergence data.
     """
-    if convergence_threshold == None:
-        early_stop = False
-    else:
-        early_stop = True
-    if num_time_steps <= 0:
-        raise ValueError("Time steps must be greater than 0.")
 
-    if evo_type not in ["state", "density"]:
-        raise ValueError("Invalid evo_type. Choose 'state' or 'density'.")
+    ### Input validation and defaults ###
+    early_stop = convergence_threshold is not None
 
-    if U_0 is None:
-        raise ValueError("Please provide an initial state U_0.")
-
-    if C_target is None and goal in ["fidelity", "both"]:
-        raise ValueError(
-            "Please provide a target state C_target for fidelity calculation."
-        )
-
-    if isbra(U_0) or isbra(C_target):
-        raise TypeError(
-            "Please provide initial and target states as kets (column vectors) or density matrices."
-        )
+    assert batch_size > 0, ValueError("batch_size must be greater than 0.")
+    assert eval_batch_size > 0, ValueError("eval_batch_size must be greater than 0.")
+    assert num_time_steps > 0, ValueError("Time steps must be greater than 0.")
+    assert learning_rate > 0, ValueError("learning_rate must be greater than 0.")
+    assert evo_type in ["state", "density"], ValueError("Invalid evo_type. Choose 'state' or 'density'.")
+    assert U_0 is not None, ValueError("Please provide an initial state U_0.")
+    assert not (C_target is None and goal in ["fidelity", "both"]), ValueError("Please provide a target state C_target for fidelity calculation.")
+    assert not (isbra(U_0) or isbra(C_target)), TypeError("Please provide initial and target states as kets (column vectors) or density matrices.")
+    assert not (evo_type == "state" and not (isket(U_0) and isket(C_target))), TypeError("For evo_type='state', please provide initial and target states as kets (column vectors).")
+    assert not (evo_type == "density" and (isket(U_0) or isket(C_target))), TypeError("For evo_type='density', please provide initial and target states as density matrices.")
+    assert goal in ["purity", "fidelity", "both"], ValueError("Invalid goal. Choose 'purity', 'fidelity', or 'both'.")
+    assert mode in ["nn", "lookup", "no-measurement"], ValueError("Invalid mode. Choose 'nn' or 'lookup' or 'no-measurement'.")
+    assert not (goal in ["purity", "both"] and evo_type == "state"), ValueError("Purity is not defined for evo_type='state'. Please use evo_type='density' for purity calculation.")
+    assert goal != "purity" or C_target is None, ValueError("C_target should not be provided when goal is 'purity'.")
+    assert evo_type != "density" or (is_positive_semi_definite(U_0) and (goal == "purity" or is_positive_semi_definite(C_target))), TypeError("For evo_type='density', initial and target states must be positive semi-definite.")
     
-    if evo_type == "state" and not (isket(U_0) and isket(C_target)):
-        raise TypeError(
-            "For evo_type='state', please provide initial and target states as kets (column vectors)."
-        )
-
-    if evo_type == "density" and (isket(U_0) or isket(C_target)):
-        raise TypeError(
-            "For evo_type='density', please provide initial and target states as density matrices."
-        )
-
-    if goal in ["purity", "both"] and evo_type == "state":
-        raise ValueError(
-            "Purity is not defined for evo_type='state'. Please use evo_type='density' for purity calculation."
-        )
-    
-    if goal == "purity" and C_target is not None:
-        raise ValueError(
-            "C_target should not be provided when goal is 'purity'."
-        )
-
-    if (
-        evo_type == "density"
-        and (
-            not is_positive_semi_definite(U_0)
-            or (goal != "purity" and not is_positive_semi_definite(C_target))
-        )
-    ):
-        raise TypeError(
-            'If evo_type=`density` Your initial and target rhos must be positive semi-definite.'
-        )
-
-
     (
         initial_params,
         parameterized_gates,
@@ -563,29 +528,26 @@ def optimize_pulse(
         decay_indices,
     ) = convert_system_params(system_params)
 
-    if (
-        evo_type == "state" or (isket(U_0) or isket(C_target))
-    ) and decay_indices != []:
-        raise ValueError(
-            "Decay requires a density matrix representation of your inital and target states because, the solver uses Lindblad equation to evolve the system with dissipation. \n"
-            "Please provide U_0 and U_target as density matrices perhaps using `utils.fidelity.ket2dm` and use evo_type='density'."
-        )
+    assert decay_indices == [] or evo_type == "density", ValueError(
+        "Decay requires a density matrix representation of your inital and target states because, the solver uses Lindblad equation to evolve the system with dissipation. \n"
+        "Please provide U_0 and U_target as density matrices perhaps using `utils.fidelity.ket2dm` and use evo_type='density'."
+    )
+    assert mode == "no-measurement" or measurement_indices, ValueError("For modes 'nn' and 'lookup', you must provide at least one measurement operator in your system_params. ")
+    assert mode != "no-measurement" or not measurement_indices , ValueError("You set a measurement flag to true, but no-measurement mode is used. Please set mode to 'nn' or 'lookup'.")
+
+    num_of_params = len(jax.tree_util.tree_leaves(initial_params))
+
+    assert len(param_constraints) == 0 or len(jax.tree_util.tree_leaves(param_constraints)) == num_of_params * 2, TypeError(
+        "Please provide upper and lower constraints for each variable in each gate, or don't provide `param_constraints` to use the default."
+    )
+
+    ### End of input validation and defaults ###
 
     parent_rng_key = jax.random.PRNGKey(0)
     train_eval_key, sub_key, rnn_key = jax.random.split(parent_rng_key, 3)
     row_key, no_meas_key = jax.random.split(sub_key)
     trainable_params = None
     param_shapes = None
-    num_of_params = len(jax.tree_util.tree_leaves(initial_params))
-
-    if param_constraints != []:
-        if (
-            len(jax.tree_util.tree_leaves(param_constraints))
-            != num_of_params * 2
-        ):
-            raise TypeError(
-                "Please provide upper and lower constraints for each variable in each gate, or don't provide `param_constraints` to use the default."
-            )
 
     if mode == "no-measurement":
         # If no feedback is used, we can just use the initial parameters
@@ -594,15 +556,7 @@ def optimize_pulse(
         trainable_params = get_trainable_parameters_for_no_meas(
             initial_params, param_constraints, num_time_steps, no_meas_key
         )
-        if not (measurement_indices == [] or measurement_indices is None):
-            raise ValueError(
-                "You set a measurement flag to true, but no-measurement mode is used. Please set mode to 'nn' or 'lookup'."
-            )
     else:
-        if measurement_indices == [] or measurement_indices is None:
-            raise ValueError(
-                "For modes 'nn' and 'lookup', you must provide at least one measurement operator in your system_params. "
-            )
         # Convert dictionary parameters to list[list] structure
         flat_params, param_shapes = prepare_parameters_from_dict(
             initial_params
